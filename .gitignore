@@ -1,0 +1,34 @@
+# Raw sequencing data
+*.fastq
+*.fastq.gz
+*.fq
+*.fq.gz
+*.tar
+*.tar.gz
+
+# Reference genome and Cell Ranger outputs
+ref_genome/
+pbmc_1k_v3_fastqs/
+run_count_1kpbmcs/
+cellranger_output/
+
+# Large R objects
+*.rds
+*.RData
+*.rda
+.Rhistory
+.Rproj.user/
+
+# Cell Ranger temporary files
+_SC_RNA_COUNTER_CS/
+*.mri
+*.mri.tgz
+*.vdr
+
+# Operating-system files
+.DS_Store
+
+# Temporary files
+*.out
+*.err
+*.log

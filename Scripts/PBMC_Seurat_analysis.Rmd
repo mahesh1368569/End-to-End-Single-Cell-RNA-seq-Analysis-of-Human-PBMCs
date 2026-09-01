@@ -1,0 +1,834 @@
+---
+title: "Single-Cell RNA-seq Analysis of Human PBMCs"
+author: "Mahesh Chinthalapudi"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: show
+    theme: cosmo
+params:
+  dataset_name: "PBMC3K"
+  data_dir: "Data/hg19"
+  results_dir: "Results"
+  figures_dir: "Figures"
+  min_features: 200
+  max_features: 2500
+  max_percent_mt: 5
+  n_variable_features: 2000
+  n_pcs: 10
+  clustering_resolution: 0.5
+  random_seed: 1234
+  run_jackstraw: false
+  apply_manual_annotations: false
+  run_singler: false
+---
+
+# Project overview
+
+Single-cell RNA sequencing (scRNA-seq) measures gene expression in individual cells, allowing transcriptionally distinct cell populations to be detected within a heterogeneous sample. This report analyzes human peripheral blood mononuclear cells (PBMCs) using a standard Seurat workflow. The main goals are to:
+
+1. identify and retain high-quality cell profiles;
+2. reduce the high-dimensional expression matrix to biologically informative components;
+3. group transcriptionally similar cells using graph-based clustering;
+4. identify cluster-enriched genes; and
+5. assign candidate immune-cell identities using canonical markers, with optional reference-based annotation.
+
+The default input path corresponds to the classic 10x Genomics PBMC3K filtered gene-barcode matrix used in the Seurat guided tutorial. If the project instead uses the PBMC1K FASTQs processed with Cell Ranger, render this notebook with the Cell Ranger output path:
+
+```r
+rmarkdown::render(
+  "PBMC_Seurat_analysis.Rmd",
+  params = list(
+    dataset_name = "PBMC1K",
+    data_dir = "Data/hg19"
+  )
+)
+```
+
+The dataset name, input path, QC thresholds, number of PCs, clustering resolution, and optional analyses are parameters in the YAML header. Keeping these choices explicit makes the analysis easier to reproduce and prevents hidden manual changes.
+
+# Analytical workflow
+
+The report follows this sequence:
+
+```text
+Filtered feature-barcode matrix
+  -> Seurat object
+  -> quality-control assessment and filtering
+  -> log normalization
+  -> highly variable feature selection
+  -> scaling and PCA
+  -> neighbor graph and clustering
+  -> UMAP visualization
+  -> cluster marker identification
+  -> marker-based annotation
+  -> optional SingleR annotation
+```
+
+This is a single-sample exploratory analysis. Cluster marker testing is used to characterize cell populations, but it should not be described as differential expression between experimental conditions. Condition-level differential expression requires biological replication and an appropriate sample-level design.
+
+# Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  fig.width = 9,
+  fig.height = 6,
+  dpi = 300
+)
+
+set.seed(params$random_seed)
+
+required_packages <- c("Seurat", "dplyr", "ggplot2", "patchwork")
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+data_dir <- here::here(params$data_dir)
+results_dir <- here::here(params$results_dir)
+figures_dir <- here::here(params$figures_dir)
+
+dir.create(results_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(figures_dir, recursive = TRUE, showWarnings = FALSE)
+
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+```
+
+The setup chunk loads only the packages required for the main workflow, fixes the random seed, and creates output directories. Package installation is intentionally excluded from the analysis because a report should not modify the software environment while it is running. Package versions are recorded at the end of the report.
+
+# Load the 10x Genomics count matrix
+
+`Read10X()` imports the sparse matrix produced by Cell Ranger. Rows represent genes, columns represent cell barcodes, and values represent unique molecular identifier (UMI) counts. A sparse representation is important because most genes are not detected in most cells.
+
+```{r load-data}
+if (!dir.exists(data_dir)) {
+  stop(
+    "Input directory not found: ", data_dir,
+    "\nConfirm that Data/hg19 contains the 10x matrix files."
+  )
+}
+
+counts <- Read10X(data.dir = data_dir)
+
+
+# Some modern 10x outputs contain multiple feature types. Use the Gene
+# Expression matrix when it is available; otherwise use the first matrix.
+if (is.list(counts)) {
+  if ("Gene Expression" %in% names(counts)) {
+    counts <- counts[["Gene Expression"]]
+  } else {
+    warning(
+      "Multiple feature types were found but no 'Gene Expression' entry was named; ",
+      "using the first matrix."
+    )
+    counts <- counts[[1]]
+  }
+}
+
+dim(counts)
+```
+
+The dimension output reports the number of genes and cell barcodes in the imported matrix. For the classic PBMC3K dataset, approximately 2,700 Cell Ranger-called cells are expected, although the exact number retained later depends on the QC thresholds.
+
+# Create the Seurat object
+
+A Seurat object stores the raw counts, cell metadata, normalized expression values, dimensional reductions, neighbor graphs, clusters, and marker-test results. During object creation, genes detected in fewer than three cells and cells with fewer than 200 detected genes are removed. These are minimal import filters; additional QC is performed below after examining the distributions.
+
+```{r create-seurat-object}
+pbmc <- CreateSeuratObject(
+  counts = counts,
+  project = params$dataset_name,
+  min.cells = 3,
+  min.features = params$min_features
+)
+
+pbmc
+```
+
+Using one consistently named object (`pbmc`) prevents the undefined-object errors in the original script, where several functions referred to `pbmc` even though the analysis object had other names.
+
+# Quality control
+
+Quality control reduces the influence of damaged cells, low-complexity profiles, and unusually complex barcodes. Three metrics are examined:
+
+- **`nFeature_RNA`**: number of genes detected in each cell. Very low values may indicate poor-quality profiles; unusually high values can be consistent with multiplets.
+- **`nCount_RNA`**: total UMI count in each cell. This is related to library size and should be interpreted together with the number of detected genes.
+- **`percent.mt`**: percentage of counts assigned to mitochondrial genes. High values can indicate damaged or stressed cells, although biological context must be considered.
+
+An upper feature threshold is only a heuristic screen for unusually complex barcodes; it is not a formal doublet-detection method.
+
+## Calculate mitochondrial percentage
+
+Human mitochondrial gene symbols generally begin with `MT-`. `PercentageFeatureSet()` calculates the percentage of counts attributable to these genes and stores it in the cell metadata.
+
+```{r mitochondrial-percentage}
+pbmc[["percent.mt"]] <- PercentageFeatureSet(pbmc, pattern = "^MT-")
+
+summary(pbmc$percent.mt)
+```
+
+If all mitochondrial percentages are zero, check whether the input uses Ensembl identifiers or a different gene-symbol convention before applying a mitochondrial filter.
+
+## Inspect QC distributions before additional filtering
+
+Thresholds should be chosen after inspecting the observed distributions rather than applied as universal rules. The values used here reproduce the common PBMC3K teaching workflow and are exposed as parameters so they can be changed for another dataset.
+
+```{r qc-before, fig.height=4}
+qc_before_plot <- VlnPlot(
+  pbmc,
+  features = c("nFeature_RNA", "nCount_RNA", "percent.mt"),
+  ncol = 3,
+  pt.size = 0.1
+) + plot_annotation(title = "QC metrics before additional filtering")
+
+qc_before_plot
+```
+
+```{r qc-scatter, fig.height=4}
+count_feature_plot <- FeatureScatter(
+  pbmc,
+  feature1 = "nCount_RNA",
+  feature2 = "nFeature_RNA"
+)
+
+count_mt_plot <- FeatureScatter(
+  pbmc,
+  feature1 = "nCount_RNA",
+  feature2 = "percent.mt"
+)
+
+count_feature_plot + count_mt_plot
+```
+
+The scatter plots help identify relationships among library size, feature complexity, and mitochondrial percentage. Abrupt thresholds should not be justified only by convention; the retained distributions and biological system should support them.
+
+## Apply QC filters
+
+Cells are retained when they have more than the minimum number of detected genes, fewer than the maximum number of detected genes, and less than the maximum mitochondrial percentage specified in the parameters.
+
+```{r qc-filter}
+n_cells_before <- ncol(pbmc)
+
+cells_to_keep <- colnames(pbmc)[
+  pbmc$nFeature_RNA > params$min_features &
+    pbmc$nFeature_RNA < params$max_features &
+    pbmc$percent.mt < params$max_percent_mt
+]
+
+if (length(cells_to_keep) == 0) {
+  stop(
+    "The current QC thresholds removed every cell. Inspect the QC plots and ",
+    "adjust the YAML parameters."
+  )
+}
+
+pbmc <- subset(pbmc, cells = cells_to_keep)
+n_cells_after <- ncol(pbmc)
+
+qc_summary <- data.frame(
+  dataset = params$dataset_name,
+  cells_before_additional_qc = n_cells_before,
+  cells_after_qc = n_cells_after,
+  cells_removed = n_cells_before - n_cells_after,
+  percent_retained = round(100 * n_cells_after / n_cells_before, 2),
+  min_features = params$min_features,
+  max_features = params$max_features,
+  max_percent_mt = params$max_percent_mt
+)
+
+knitr::kable(qc_summary, caption = "Cell-retention summary")
+```
+
+```{r qc-after, fig.height=4}
+qc_after_plot <- VlnPlot(
+  pbmc,
+  features = c("nFeature_RNA", "nCount_RNA", "percent.mt"),
+  ncol = 3,
+  pt.size = 0.1
+) + plot_annotation(title = "QC metrics after filtering")
+
+qc_after_plot
+
+qc_combined_plot <- qc_before_plot / qc_after_plot
+
+ggsave(
+  filename = file.path(figures_dir, "01_qc_before_after.png"),
+  plot = qc_combined_plot,
+  width = 12,
+  height = 8,
+  dpi = 300
+)
+```
+
+# Normalize gene expression
+
+Cells differ in the total number of detected molecules. `LogNormalize` divides each gene count by the total counts in that cell, multiplies by 10,000, and applies a log transformation. This reduces library-size effects and makes expression values more comparable among cells while retaining a familiar interpretation.
+
+```{r normalize-data}
+pbmc <- NormalizeData(
+  pbmc,
+  normalization.method = "LogNormalize",
+  scale.factor = 10000,
+  verbose = FALSE
+)
+```
+
+Normalization does not make cells biological replicates and does not remove every technical effect. It prepares the expression matrix for feature selection, visualization, and downstream modeling.
+
+# Identify highly variable features
+
+Many genes provide little information for separating cell populations because they are nearly constant or rarely detected. `FindVariableFeatures()` identifies genes with greater cell-to-cell variation than expected at their mean expression level. PCA is then focused on these informative features.
+
+```{r variable-features}
+pbmc <- FindVariableFeatures(
+  pbmc,
+  selection.method = "vst",
+  nfeatures = params$n_variable_features,
+  verbose = FALSE
+)
+
+top10_variable <- head(VariableFeatures(pbmc), 10)
+
+variable_plot <- VariableFeaturePlot(pbmc)
+labeled_variable_plot <- LabelPoints(
+  plot = variable_plot,
+  points = top10_variable,
+  repel = TRUE
+)
+
+labeled_variable_plot
+
+ggsave(
+  filename = file.path(figures_dir, "02_variable_features.png"),
+  plot = labeled_variable_plot,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+```
+
+Variable-feature selection reduces noise and computational cost. A highly variable gene is not automatically a cell-type marker; technical effects and cell-state programs can also generate variability.
+
+# Scale the expression matrix
+
+Scaling centers each gene at zero and standardizes its variance. Without scaling, highly expressed genes could dominate PCA simply because of their measurement scale. All retained genes are scaled here because the PBMC dataset is small and the later marker heatmap may include genes outside the variable-feature set.
+
+```{r scale-data}
+pbmc <- ScaleData(
+  pbmc,
+  features = rownames(pbmc),
+  verbose = FALSE
+)
+```
+
+For much larger datasets, scaling only the variable features can reduce memory use. Potential covariates should be regressed only with a clear technical or biological rationale; automatically regressing mitochondrial percentage or cell-cycle effects can remove meaningful biology.
+
+# Principal component analysis
+
+PCA compresses correlated gene-expression patterns into a smaller number of orthogonal components. Each principal component represents a weighted combination of genes and can capture a major source of biological or technical variation.
+
+```{r run-pca}
+n_pcs_to_compute <- max(30, params$n_pcs)
+n_pcs_to_compute <- min(
+  n_pcs_to_compute,
+  length(VariableFeatures(pbmc)) - 1,
+  ncol(pbmc) - 1
+)
+
+if (n_pcs_to_compute < params$n_pcs) {
+  stop(
+    "The requested number of PCs exceeds what can be computed from this dataset."
+  )
+}
+
+pbmc <- RunPCA(
+  pbmc,
+  features = VariableFeatures(pbmc),
+  npcs = n_pcs_to_compute,
+  verbose = FALSE
+)
+
+print(pbmc[["pca"]], dims = 1:5, nfeatures = 5)
+```
+
+The printed loadings identify genes that contribute strongly to the first PCs. These genes should be examined to determine whether the PCs represent recognizable immune-cell programs, technical variation, or both.
+
+## Visualize PCA structure and loadings
+
+```{r pca-visualization}
+DimPlot(pbmc, reduction = "pca")
+
+VizDimLoadings(pbmc, dims = 1:2, reduction = "pca")
+```
+
+```{r pca-heatmap, fig.height=10}
+DimHeatmap(
+  pbmc,
+  dims = 1:min(15, n_pcs_to_compute),
+  cells = min(500, ncol(pbmc)),
+  balanced = TRUE
+)
+```
+
+The PC heatmap shows whether high-loading genes define coherent cell groups. Components dominated by a few technical genes should be interpreted cautiously.
+
+# Select PCs for downstream analysis
+
+The elbow plot ranks PCs by their standard deviation. A bend in the curve indicates where later PCs contribute progressively less variation. PC selection should also consider loading genes and heatmaps; it should not be based on the elbow plot alone.
+
+```{r elbow-plot}
+elbow_plot <- ElbowPlot(pbmc, ndims = min(30, n_pcs_to_compute)) +
+  geom_vline(
+    xintercept = params$n_pcs,
+    linetype = "dashed",
+    color = "red"
+  ) +
+  labs(
+    subtitle = paste("Dashed line indicates", params$n_pcs, "PCs used downstream")
+  )
+
+elbow_plot
+
+ggsave(
+  filename = file.path(figures_dir, "03_pca_elbow.png"),
+  plot = elbow_plot,
+  width = 7,
+  height = 5,
+  dpi = 300
+)
+```
+
+## Optional JackStraw analysis
+
+The JackStraw procedure estimates PC significance by comparing observed feature scores with a null distribution. It is computationally expensive and is not routinely required for this small demonstration, so it is disabled by default. Set `run_jackstraw: true` in the YAML header to run it.
+
+```{r jackstraw, eval=params$run_jackstraw}
+pbmc <- JackStraw(pbmc, num.replicate = 100)
+pbmc <- ScoreJackStraw(
+  pbmc,
+  dims = 1:min(20, n_pcs_to_compute)
+)
+
+JackStrawPlot(pbmc, dims = 1:min(20, n_pcs_to_compute))
+```
+
+# Construct the neighbor graph and identify clusters
+
+Seurat constructs a K-nearest-neighbor graph in PCA space and refines it using shared neighborhood information. Community detection is then used to identify groups of cells with similar expression profiles. The clustering resolution controls granularity: higher values generally produce more clusters, whereas lower values produce fewer clusters.
+
+```{r clustering}
+pcs_to_use <- seq_len(params$n_pcs)
+
+pbmc <- FindNeighbors(
+  pbmc,
+  dims = pcs_to_use,
+  verbose = FALSE
+)
+
+pbmc <- FindClusters(
+  pbmc,
+  resolution = params$clustering_resolution,
+  random.seed = params$random_seed,
+  verbose = FALSE
+)
+
+cluster_counts <- as.data.frame(table(cluster = Idents(pbmc)))
+names(cluster_counts)[2] <- "cells"
+
+knitr::kable(cluster_counts, caption = "Number of cells in each cluster")
+```
+
+Clusters are analytical groups, not confirmed cell types. Their biological identities must be evaluated using multiple markers and, when available, external evidence.
+
+# UMAP visualization
+
+UMAP provides a two-dimensional representation of local relationships among cells. It is useful for visualization but should not be used to measure exact distances, infer developmental trajectories, or establish statistical significance.
+
+```{r run-umap}
+pbmc <- RunUMAP(
+  pbmc,
+  dims = pcs_to_use,
+  seed.use = params$random_seed,
+  verbose = FALSE
+)
+
+umap_cluster_plot <- DimPlot(
+  pbmc,
+  reduction = "umap",
+  label = TRUE,
+  repel = TRUE,
+  pt.size = 0.5
+) +
+  NoLegend() +
+  labs(title = paste(params$dataset_name, "Seurat clusters"))
+
+umap_cluster_plot
+
+ggsave(
+  filename = file.path(figures_dir, "04_umap_clusters.png"),
+  plot = umap_cluster_plot,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+```
+
+An optional t-SNE representation can be generated with `RunTSNE(pbmc, dims = pcs_to_use)`. It is omitted from the main workflow because adding another embedding does not change the clustering or provide independent biological validation.
+
+# Identify cluster markers
+
+`FindAllMarkers()` compares every cluster with all remaining cells and identifies positively enriched genes. These are cluster-marker tests, not treatment-versus-control differential expression tests. Cells within one donor are not independent biological replicates for condition-level inference.
+
+```{r find-all-markers}
+# cluster_markers <- FindAllMarkers(
+ # pbmc,
+  #only.pos = TRUE,
+  #min.pct = 0.25,
+  #logfc.threshold = 0.25,
+#)
+
+#if (nrow(cluster_markers) == 0) {
+  #stop(
+    #"No cluster markers passed the current thresholds. Inspect the clustering ",
+    #"and adjust marker thresholds only with a clear rationale."
+  #)
+#}
+
+#top_markers <- cluster_markers %>%
+  #group_by(cluster) %>%
+  #slice_max(order_by = avg_log2FC, n = 5, with_ties = FALSE) %>%
+ # ungroup()
+
+#knitr::kable(
+  #top_markers,
+  #digits = 3,
+  #caption = "Top five positive markers for each cluster"
+)
+```
+
+## Example: markers for one cluster
+
+The original script assumed clusters 2 and 5 existed. That can fail when the number or numbering of clusters changes. Here, the first observed cluster is selected programmatically.
+
+```{r example-cluster-markers}
+#example_cluster <- levels(Idents(pbmc))[1]
+
+#example_cluster_markers <- FindMarkers(
+  #pbmc,
+  #ident.1 = example_cluster,
+  #min.pct = 0.25,
+  #logfc.threshold = 0.25,
+  #verbose = FALSE
+#)
+
+#head(example_cluster_markers, 10)
+```
+
+# Evaluate canonical PBMC markers
+
+Cell-type annotation should be supported by several concordant genes rather than one marker. The following panel covers broad T-cell, B-cell, natural-killer-cell, monocyte, dendritic-cell, and platelet identities.
+
+```{r canonical-marker-panel}
+canonical_markers <- c(
+  "CCR7", "IL7R", "LTB", "CD3D", "CD3E", "CD8A", "CCL5",
+  "MS4A1", "CD79A", "CD74",
+  "NKG7", "GNLY", "PRF1",
+  "LYZ", "S100A8", "S100A9", "FCGR3A", "LST1",
+  "FCER1A", "CST3", "CD1C",
+  "PPBP", "PF4"
+)
+
+available_markers <- intersect(canonical_markers, rownames(pbmc))
+missing_markers <- setdiff(canonical_markers, available_markers)
+
+if (length(available_markers) == 0) {
+  stop(
+    "None of the canonical marker symbols were found. Check whether the matrix ",
+    "uses Ensembl identifiers rather than gene symbols."
+  )
+}
+
+if (length(missing_markers) > 0) {
+  message("Markers absent from the matrix: ", paste(missing_markers, collapse = ", "))
+}
+
+marker_dotplot <- DotPlot(pbmc, features = available_markers) +
+  RotatedAxis() +
+  labs(
+    title = "Canonical PBMC marker expression by cluster",
+    x = "Marker gene",
+    y = "Seurat cluster"
+  )
+
+marker_dotplot
+
+ggsave(
+  filename = file.path(figures_dir, "05_marker_dotplot.png"),
+  plot = marker_dotplot,
+  width = 13,
+  height = 6,
+  dpi = 300
+)
+```
+
+In a dot plot, color represents average expression and dot size represents the percentage of cells expressing the gene. A convincing annotation should be supported by a coherent marker pattern and absence of strong contradictory markers.
+
+## Feature plots for representative markers
+
+```{r marker-feature-plots, fig.height=8}
+representative_markers <- intersect(
+  c("MS4A1", "GNLY", "CD3E", "CD14", "FCER1A", "FCGR3A", "LYZ", "PPBP", "CD8A"),
+  rownames(pbmc)
+)
+
+if (length(representative_markers) > 0) {
+  FeaturePlot(
+    pbmc,
+    features = representative_markers,
+    reduction = "umap",
+    ncol = 3,
+    order = TRUE
+  )
+}
+```
+
+## Marker heatmap
+
+The heatmap summarizes the scaled expression of the strongest cluster markers. To keep the figure readable, up to ten markers per cluster are displayed.
+
+```{r marker-heatmap, fig.height=10}
+heatmap_markers <- cluster_markers %>%
+  group_by(cluster) %>%
+  slice_max(order_by = avg_log2FC, n = 10, with_ties = FALSE) %>%
+  ungroup()
+
+heatmap_features <- unique(heatmap_markers$gene)
+heatmap_features <- intersect(heatmap_features, rownames(pbmc))
+
+marker_heatmap <- DoHeatmap(
+  pbmc,
+  features = heatmap_features,
+  group.by = "seurat_clusters"
+) + NoLegend()
+
+marker_heatmap
+
+ggsave(
+  filename = file.path(params$figures_dir, "06_marker_heatmap.png"),
+  plot = marker_heatmap,
+  width = 12,
+  height = 10,
+  dpi = 300
+)
+```
+
+# Optional manual cell-type annotation
+
+The mapping below reproduces the commonly used PBMC3K tutorial labels. Cluster numbers are not universal: they can change with the dataset, software version, PC choice, resolution, or random seed. For that reason, automatic renaming is disabled by default. Review the dot plot, feature plots, top-marker table, and heatmap first. Only then set `apply_manual_annotations: true` if the mapping is supported by this run.
+
+```{r manual-annotation, eval=params$apply_manual_annotations}
+annotation_map <- c(
+  "0" = "Naive CD4 T",
+  "1" = "CD14+ Monocyte",
+  "2" = "Memory CD4 T",
+  "3" = "B cell",
+  "4" = "CD8 T",
+  "5" = "FCGR3A+ Monocyte",
+  "6" = "NK cell",
+  "7" = "Dendritic cell",
+  "8" = "Platelet"
+)
+
+observed_clusters <- levels(Idents(pbmc))
+unmapped_clusters <- setdiff(observed_clusters, names(annotation_map))
+
+if (length(unmapped_clusters) > 0) {
+  stop(
+    "Manual annotation was requested, but these clusters have no label: ",
+    paste(unmapped_clusters, collapse = ", "),
+    ". Update annotation_map after reviewing their markers."
+  )
+}
+
+# Retain only mappings for clusters that are present and preserve cluster order.
+annotation_map <- annotation_map[observed_clusters]
+pbmc <- RenameIdents(pbmc, annotation_map)
+pbmc$cell_type <- as.character(Idents(pbmc))
+
+umap_celltype_plot <- DimPlot(
+  pbmc,
+  reduction = "umap",
+  group.by = "cell_type",
+  label = TRUE,
+  repel = TRUE,
+  pt.size = 0.5
+) +
+  NoLegend() +
+  labs(title = paste(params$dataset_name, "marker-supported cell types"))
+
+umap_celltype_plot
+
+ggsave(
+  filename = file.path(params$figures_dir, "07_umap_cell_types.png"),
+  plot = umap_celltype_plot,
+  width = 9,
+  height = 7,
+  dpi = 300
+)
+```
+
+# Optional reference-based annotation with SingleR
+
+SingleR compares each cell's normalized expression profile with labeled reference profiles. It can provide independent supporting evidence, but its labels depend on the suitability and resolution of the reference. Reference predictions should be compared with cluster markers rather than accepted automatically.
+
+This section is disabled by default because `SingleR` and `celldex` are optional Bioconductor dependencies. Set `run_singler: true` after installing them.
+
+```{r singler-annotation, eval=params$run_singler}
+singler_packages <- c("SingleR", "celldex")
+missing_singler_packages <- singler_packages[
+  !vapply(singler_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_singler_packages) > 0) {
+  stop(
+    "Install the following Bioconductor packages before enabling SingleR: ",
+    paste(missing_singler_packages, collapse = ", ")
+  )
+}
+
+reference <- celldex::HumanPrimaryCellAtlasData()
+
+if (packageVersion("SeuratObject") >= "5.0.0") {
+  normalized_expression <- GetAssayData(pbmc, assay = "RNA", layer = "data")
+} else {
+  normalized_expression <- GetAssayData(pbmc, assay = "RNA", slot = "data")
+}
+
+singler_predictions <- SingleR::SingleR(
+  test = normalized_expression,
+  ref = reference,
+  labels = reference$label.main
+)
+
+pbmc$SingleR_label <- singler_predictions$pruned.labels
+missing_predictions <- is.na(pbmc$SingleR_label)
+pbmc$SingleR_label[missing_predictions] <- singler_predictions$labels[missing_predictions]
+
+singler_umap <- DimPlot(
+  pbmc,
+  reduction = "umap",
+  group.by = "SingleR_label",
+  label = TRUE,
+  repel = TRUE,
+  pt.size = 0.4
+) +
+  NoLegend() +
+  labs(title = "SingleR reference-based labels")
+
+singler_umap
+
+ggsave(
+  filename = file.path(figures_dir, "08_umap_singler_labels.png"),
+  plot = singler_umap,
+  width = 10,
+  height = 8,
+  dpi = 300
+)
+
+singler_table <- data.frame(
+  cell = colnames(pbmc),
+  label = singler_predictions$labels,
+  pruned_label = singler_predictions$pruned.labels,
+  score_delta = singler_predictions$delta.next,
+  row.names = NULL
+)
+
+write.csv(
+  singler_table,
+  file.path(results_dir, "singler_cell_labels.csv"),
+  row.names = FALSE
+)
+```
+
+# Export reproducible results
+
+Small result tables and publication-quality figures are useful for GitHub because they allow readers to inspect the output without rerunning the analysis. The raw FASTQs, reference genome, complete Cell Ranger output, and large Seurat object should normally remain outside Git version control.
+
+```{r export-results}
+write.csv(
+  qc_summary,
+  file.path(results_dir, "qc_summary.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  cluster_counts,
+  file.path(results_dir, "cluster_cell_counts.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  cluster_markers,
+  file.path(results_dir, "cluster_markers.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  top_markers,
+  file.path(results_dir, "top_cluster_markers.csv"),
+  row.names = FALSE
+)
+
+saveRDS(
+  pbmc,
+  file.path(results_dir, "pbmc_seurat_processed.rds")
+)
+```
+
+The `.rds` file is useful locally because it preserves the processed object, but it may be too large for a normal GitHub repository. Add `*.rds` to `.gitignore` and regenerate the object from this report when needed.
+
+# Interpretation checklist
+
+Before describing the biological results, verify the following:
+
+1. QC filtering retained a plausible number of cells and did not remove an entire biologically relevant population.
+2. Selected PCs contain coherent immune-cell expression programs rather than being dominated by technical genes.
+3. Clusters are supported by multiple enriched genes.
+4. Candidate cell labels agree with the dot plot, feature plots, and marker heatmap.
+5. Closely related T-cell and monocyte populations are labeled conservatively when markers are ambiguous.
+6. Cluster-marker results are not presented as replicated condition-level differential expression.
+
+# Limitations
+
+- A single donor cannot support population-level inference about treatment, disease, or demographic effects.
+- Fixed QC thresholds may not transfer to another tissue, chemistry, or sequencing depth.
+- High mitochondrial expression can reflect damage, stress, or true biological state; its interpretation is context dependent.
+- The upper feature cutoff is not a substitute for a dedicated doublet-detection method.
+- Clustering and annotation depend on the selected PCs and resolution.
+- UMAP is a visualization and does not by itself validate cell types or relationships.
+- Reference-based labels inherit the biases and category definitions of the reference dataset.
+
+# Reproducibility information
+
+The session information below records R, Seurat, and dependency versions used to render the report.
+
+```{r session-info}
+sessionInfo()
+```
+
+# References and resources
+
+- 10x Genomics. *3k PBMCs from a Healthy Donor.*
+- Seurat. *Guided Clustering Tutorial: PBMC 3K.* <https://satijalab.org/seurat/articles/pbmc3k_tutorial>
+- Seurat function reference. <https://satijalab.org/seurat/reference/>
+- SingleR Bioconductor vignette. <https://bioconductor.org/packages/SingleR>
+- celldex Bioconductor package. <https://bioconductor.org/packages/celldex>
