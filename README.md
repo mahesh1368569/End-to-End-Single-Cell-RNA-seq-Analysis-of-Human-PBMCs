@@ -392,7 +392,6 @@ The small PBMC3K matrix may be retained if desired, but linking to the official 
 ## Author
 
 **Mahesh Chinthalapudi**  
-Bioinformatics, microbiome, and multi-omics research
 
 ## License
 
